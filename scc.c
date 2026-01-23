@@ -4,20 +4,21 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#define int long long
+enum { WORD_SIZE = 8 };
 
 char *p,      // current position in source code
   *data,   // data/bss pointer
   *data_start;
 
-int *e, *text,  // current position in emitted code and base pointer
-    *id,        // currently parsed identifier
-    *sym,       // symbol table (simple list of identifiers)
-    tk,         // current token
-    ival,       // current token value
-    ty,         // current expression type
-    loc,        // local variable offset
-    line;       // current line number
+long *e, *text,  // current position in emitted code and base pointer
+   *id,        // currently parsed identifier
+   *sym;       // symbol table (simple list of identifiers)
+int tk,            // current token
+  ty,            // current expression type
+  loc,           // local variable offset
+  line,          // current line number
+  local_slot_count; // running slot index for parameters/locals
+long ival;       // current token value
 
 // tokens and classes (operators last and in precedence order)
 enum { Num = 128, Fun, Sys, Glo, Loc, Id, Char, Else, Enum, If, Int, Return, Sizeof, While, Assign, Cond, Lor, Lan, Or, Xor, And, Eq, Ne, Lt, Gt, Le, Ge, Shl, Shr, Add, Sub, Mul, Div, Mod, Inc, Dec, Brak };
@@ -49,7 +50,7 @@ void next()
         if (tk == id[Hash] && !memcmp((char *)id[Name], pp, p - pp)) { tk = id[Tk]; return; }
         id = id + Idsz;
       }
-      id[Name] = (int)pp;
+      id[Name] = (long)pp;
       id[Hash] = tk;
       tk = id[Tk] = Id;
       return;
@@ -75,7 +76,11 @@ void next()
         if (tk == '"') *data++ = ival;
       }
       ++p;
-      if (tk == '"') ival = (int)pp; else tk = Num;
+      if (tk == '"') {
+        *data++ = 0;
+        ival = (long)pp;
+      }
+      else tk = Num;
       return;
     }
     else if (tk == '=') { if (*p == '=') { ++p; tk = Eq; } else tk = Assign; return; }
@@ -97,21 +102,24 @@ void next()
 
 void expr(int lev)
 {
-  int t, *d;
+  int t;
+  long *d, aligned;
 
   if (!tk) { printf("%d: unexpected eof in expression\n", line); exit(-1); }
   else if (tk == Num) { *++e = IMM; *++e = ival; next(); ty = INT; }
   else if (tk == '"') {
     *++e = IMM; *++e = ival; next();
     while (tk == '"') next();
-    data = (char *)((int)data + sizeof(int) & -sizeof(int)); ty = PTR;
+    aligned = ((long)data + WORD_SIZE - 1) & -(long)WORD_SIZE;
+    data = (char *)aligned;
+    ty = PTR;
   }
   else if (tk == Sizeof) {
     next(); if (tk == '(') next(); else { printf("%d: open paren expected in sizeof\n", line); exit(-1); }
     ty = INT; if (tk == Int) next(); else if (tk == Char) { next(); ty = CHAR; }
     while (tk == Mul) { next(); ty = ty + PTR; }
     if (tk == ')') next(); else { printf("%d: close paren expected in sizeof\n", line); exit(-1); }
-    *++e = IMM; *++e = (ty == CHAR) ? sizeof(char) : sizeof(int);
+    *++e = IMM; *++e = (ty == CHAR) ? (long)sizeof(char) : (long)WORD_SIZE;
     ty = INT;
   }
   else if (tk == Id) {
@@ -173,7 +181,7 @@ void expr(int lev)
     else if (*e == LI) { *e = PSH; *++e = LI; }
     else { printf("%d: bad lvalue in pre-increment\n", line); exit(-1); }
     *++e = PSH;
-    *++e = IMM; *++e = (ty > PTR) ? sizeof(int) : sizeof(char);
+    *++e = IMM; *++e = (ty > PTR) ? (long)WORD_SIZE : (long)sizeof(char);
     *++e = (t == Inc) ? ADD : SUB;
     *++e = (ty == CHAR) ? SC : SI;
   }
@@ -191,12 +199,12 @@ void expr(int lev)
       *++e = BZ; d = ++e;
       expr(Assign);
       if (tk == ':') next(); else { printf("%d: conditional missing colon\n", line); exit(-1); }
-      *d = (int)(e + 3); *++e = JMP; d = ++e;
+      *d = (long)(e + 3); *++e = JMP; d = ++e;
       expr(Cond);
-      *d = (int)(e + 1);
+      *d = (long)(e + 1);
     }
-    else if (tk == Lor) { next(); *++e = BNZ; d = ++e; expr(Lan); *d = (int)(e + 1); ty = INT; }
-    else if (tk == Lan) { next(); *++e = BZ;  d = ++e; expr(Or);  *d = (int)(e + 1); ty = INT; }
+    else if (tk == Lor) { next(); *++e = BNZ; d = ++e; expr(Lan); *d = (long)(e + 1); ty = INT; }
+    else if (tk == Lan) { next(); *++e = BZ;  d = ++e; expr(Or);  *d = (long)(e + 1); ty = INT; }
     else if (tk == Or)  { next(); *++e = PSH; expr(Xor); *++e = OR;  ty = INT; }
     else if (tk == Xor) { next(); *++e = PSH; expr(And); *++e = XOR; ty = INT; }
     else if (tk == And) { next(); *++e = PSH; expr(Eq);  *++e = AND; ty = INT; }
@@ -210,13 +218,13 @@ void expr(int lev)
     else if (tk == Shr) { next(); *++e = PSH; expr(Add); *++e = SHR; ty = INT; }
     else if (tk == Add) {
       next(); *++e = PSH; expr(Mul);
-      if ((ty = t) > PTR) { *++e = PSH; *++e = IMM; *++e = sizeof(int); *++e = MUL;  }
+      if ((ty = t) > PTR) { *++e = PSH; *++e = IMM; *++e = WORD_SIZE; *++e = MUL;  }
       *++e = ADD;
     }
     else if (tk == Sub) {
       next(); *++e = PSH; expr(Mul);
-      if (t > PTR && t == ty) { *++e = SUB; *++e = PSH; *++e = IMM; *++e = sizeof(int); *++e = DIV; ty = INT; }
-      else if ((ty = t) > PTR) { *++e = PSH; *++e = IMM; *++e = sizeof(int); *++e = MUL; *++e = SUB; }
+      if (t > PTR && t == ty) { *++e = SUB; *++e = PSH; *++e = IMM; *++e = WORD_SIZE; *++e = DIV; ty = INT; }
+      else if ((ty = t) > PTR) { *++e = PSH; *++e = IMM; *++e = WORD_SIZE; *++e = MUL; *++e = SUB; }
       else *++e = SUB;
     }
     else if (tk == Mul) { next(); *++e = PSH; expr(Inc); *++e = MUL; ty = INT; }
@@ -226,17 +234,17 @@ void expr(int lev)
       if (*e == LC) { *e = PSH; *++e = LC; }
       else if (*e == LI) { *e = PSH; *++e = LI; }
       else { printf("%d: bad lvalue in post-increment\n", line); exit(-1); }
-      *++e = PSH; *++e = IMM; *++e = (ty > PTR) ? sizeof(int) : sizeof(char);
+      *++e = PSH; *++e = IMM; *++e = (ty > PTR) ? WORD_SIZE : (long)sizeof(char);
       *++e = (tk == Inc) ? ADD : SUB;
       *++e = (ty == CHAR) ? SC : SI;
-      *++e = PSH; *++e = IMM; *++e = (ty > PTR) ? sizeof(int) : sizeof(char);
+      *++e = PSH; *++e = IMM; *++e = (ty > PTR) ? WORD_SIZE : (long)sizeof(char);
       *++e = (tk == Inc) ? SUB : ADD;
       next();
     }
     else if (tk == Brak) {
       next(); *++e = PSH; expr(Assign);
       if (tk == ']') next(); else { printf("%d: close bracket expected\n", line); exit(-1); }
-      if (t > PTR) { *++e = PSH; *++e = IMM; *++e = sizeof(int); *++e = MUL;  }
+      if (t > PTR) { *++e = PSH; *++e = IMM; *++e = WORD_SIZE; *++e = MUL;  }
       else if (t < PTR) { printf("%d: pointer type expected\n", line); exit(-1); }
       *++e = ADD;
       *++e = ((ty = t - PTR) == CHAR) ? LC : LI;
@@ -245,9 +253,44 @@ void expr(int lev)
   }
 }
 
+void parse_local_declaration()
+{
+  int base_type, decl_type, more, store_type;
+  long *var_id;
+  base_type = (tk == Int) ? INT : CHAR;
+  next();
+  more = 1;
+  while (more) {
+    decl_type = base_type;
+    while (tk == Mul) { next(); decl_type = decl_type + PTR; }
+    if (tk != Id) { printf("%d: bad local declaration\n", line); exit(-1); }
+    if (id[Class] == Loc) { printf("%d: duplicate local definition\n", line); exit(-1); }
+    var_id = id;
+    id[HClass] = id[Class]; id[Class] = Loc;
+    id[HType]  = id[Type];  id[Type] = decl_type;
+    id[HVal]   = id[Val];   id[Val] = ++local_slot_count;
+    next();
+    if (tk == Assign) {
+      store_type = decl_type;
+      next();
+      *++e = LEA; *++e = loc - var_id[Val];
+      *++e = PSH;
+      expr(Assign);
+      *++e = (store_type == CHAR) ? SC : SI;
+    }
+    if (tk == ',') next();
+    else more = 0;
+  }
+  if (tk == ';') next(); else { printf("%d: semicolon expected\n", line); exit(-1); }
+}
+
 void stmt()
 {
-  int *a, *b;
+  long *a, *b;
+  if (tk == Int || tk == Char) {
+    parse_local_declaration();
+    return;
+  }
   if (tk == If) {
     next();
     if (tk == '(') next(); else { printf("%d: open paren expected\n", line); exit(-1); }
@@ -256,11 +299,11 @@ void stmt()
     *++e = BZ; b = ++e;
     stmt();
     if (tk == Else) {
-      *b = (int)(e + 3); *++e = JMP; b = ++e;
+      *b = (long)(e + 3); *++e = JMP; b = ++e;
       next();
       stmt();
     }
-    *b = (int)(e + 1);
+    *b = (long)(e + 1);
   }
   else if (tk == While) {
     next();
@@ -270,8 +313,8 @@ void stmt()
     if (tk == ')') next(); else { printf("%d: close paren expected\n", line); exit(-1); }
     *++e = BZ; b = ++e;
     stmt();
-    *++e = JMP; *++e = (int)a;
-    *b = (int)(e + 1);
+    *++e = JMP; *++e = (long)a;
+    *b = (long)(e + 1);
   }
   else if (tk == Return) {
     next();
@@ -295,7 +338,9 @@ void stmt()
 
 enum { STACK_SLOTS = 65536, ASM_BUF_SIZE = 4096 };
 
-int asm_fd, asm_len, ins_count, total_words, *ins_op, *ins_arg, *ins_has_arg, *ins_off, *word_map_arr;
+int asm_fd, asm_len, ins_count, total_words;
+int *ins_op, *ins_has_arg, *ins_off, *word_map_arr;
+long *ins_arg;
 
 char *asm_buf, *hex_digits, **labels;
 
@@ -307,8 +352,7 @@ void fail(char *msg)
 
 int str_len(char *s)
 {
-  int n;
-  n = 0;
+  int n = 0;
   if (!s) return 0;
   while (s[n]) ++n;
   return n;
@@ -316,12 +360,10 @@ int str_len(char *s)
 
 char *dup_string(char *src)
 {
-  int len, i;
+  int len = str_len(src), i = 0;
   char *dst;
-  len = str_len(src);
   dst = malloc(len + 1);
   if (!dst) fail("out of memory");
-  i = 0;
   while (i <= len) { dst[i] = src[i]; ++i; }
   return dst;
 }
@@ -350,13 +392,13 @@ void out_str(char *s)
   while (s && *s) { out_char(*s); ++s; }
 }
 
-void out_uint_recursive(int v)
+void out_uint_recursive(long v)
 {
   if (v >= 10) out_uint_recursive(v / 10);
-  out_char('0' + (v % 10));
+  out_char('0' + (int)(v % 10));
 }
 
-void out_int(int v)
+void out_int(long v)
 {
   if (v == 0) { out_char('0'); return; }
   if (v < 0)  { out_char('-'); v = -v; }
@@ -387,30 +429,26 @@ int op_has_arg(int op)
 
 int call_arg_count(int idx)
 {
-  if (idx + 1 < ins_count && ins_op[idx + 1] == ADJ) return ins_arg[idx + 1];
+  if (idx + 1 < ins_count && ins_op[idx + 1] == ADJ) return (int)ins_arg[idx + 1];
   return 0;
 }
 
 void build_instructions()
 {
-  int *pc, i;
+  int i = 0;
   total_words = (int)(e - text);
   if (total_words <= 0) fail("no code emitted");
   ins_op = malloc(sizeof(int) * total_words);
-  ins_arg = malloc(sizeof(int) * total_words);
+  ins_arg = malloc(sizeof(long) * total_words);
   ins_has_arg = malloc(sizeof(int) * total_words);
   ins_off = malloc(sizeof(int) * total_words);
   word_map_arr = malloc(sizeof(int) * (total_words + 2));
   if (!ins_op || !ins_arg || !ins_has_arg || !ins_off || !word_map_arr) fail("out of memory");
-  i = 0;
-  while (i < total_words + 2) {
-    word_map_arr[i] = -1;
-    ++i;
-  }
+  while (i < total_words + 2) { word_map_arr[i] = -1; ++i; }
   ins_count = 0;
-  pc = text + 1;
+  long *pc = text + 1;
   while (pc <= e) {
-    ins_op[ins_count] = *pc;
+    ins_op[ins_count] = (int)*pc;
     ins_off[ins_count] = (int)(pc - text);
     word_map_arr[ins_off[ins_count]] = ins_count;
     ins_has_arg[ins_count] = 0;
@@ -425,27 +463,23 @@ void build_instructions()
   }
 }
 
-int pointer_to_index(int value)
+int pointer_to_index(long value)
 {
-  int offset;
   if (!value) return -1;
-  offset = (int)(((int *)value) - text);
+  long *addr = (long *)value;
+  long offset = addr - text;
   if (offset < 0 || offset >= total_words + 2) return -1;
   return word_map_arr[offset];
 }
 
 char *make_numeric_label(int index)
 {
-  int len, v, pos;
   char *name;
-  len = 1;
-  v = index;
+  int len = 1;
+  int v = index;
   if (v > 0) {
     len = 0;
-    while (v > 0) {
-      ++len;
-      v = v / 10;
-    }
+    while (v > 0) { ++len; v = v / 10; }
   }
   name = malloc(len + 2);
   if (!name) fail("out of memory");
@@ -454,7 +488,7 @@ char *make_numeric_label(int index)
   v = index;
   if (v == 0) name[1] = '0';
   else {
-    pos = len;
+    int pos = len;
     while (v > 0) {
       name[pos] = '0' + (v % 10);
       v = v / 10;
@@ -464,18 +498,15 @@ char *make_numeric_label(int index)
   return name;
 }
 
-char *identifier_name(int value)
+char *identifier_name(long value)
 {
-  char *src, *name;
-  int len, i;
+  int len = 0, i = 0;
   if (!value) return 0;
-  src = (char *)value;
-  len = 0;
+  char *src = (char *)value;
   while (is_ident_char(src[len])) ++len;
   if (!len) return 0;
-  name = malloc(len + 1);
+  char *name = malloc(len + 1);
   if (!name) fail("out of memory");
-  i = 0;
   while (i < len) { name[i] = src[i]; ++i; }
   name[len] = 0;
   return name;
@@ -483,20 +514,18 @@ char *identifier_name(int value)
 
 void assign_function_labels()
 {
-  int *cur, idx, len, i;
-  char *name, *label;
-  cur = sym;
+  long *cur = sym;
   while (cur[Tk]) {
     if (cur[Class] == Fun && cur[Val]) {
-      idx = pointer_to_index(cur[Val]);
+      int idx = pointer_to_index(cur[Val]);
       if (idx >= 0) {
-        name = identifier_name(cur[Name]);
+        char *name = identifier_name(cur[Name]);
         if (name) {
-          len = str_len(name);
-          label = malloc(len + 4);
+          int len = str_len(name);
+          char *label = malloc(len + 4);
           if (!label) fail("out of memory");
           label[0] = 'f'; label[1] = 'n'; label[2] = '_';
-          i = 0;
+          int i = 0;
           while (i < len) { label[3 + i] = name[i]; ++i; }
           label[3 + len] = 0;
           free(labels[idx]);
@@ -511,16 +540,9 @@ void assign_function_labels()
 
 void emit_data_section()
 {
-  int size, idx, chunk, j, byte;
-  size = (int)(data - data_start);
-  out_str("section .data\n");
-  out_str("align 8\n");
-  out_str("data_area:\n");
-  if (!size) {
-    out_str("    db 0\n\n");
-    return;
-  }
-  idx = 0;
+  int size = (int)(data - data_start), idx = 0, chunk, j, byte;
+  out_str("section .data\nalign 8\ndata_area:\n");
+  if (!size) { out_str("    db 0\n\n"); return; }
   while (idx < size) {
     chunk = 16;
     if (size - idx < chunk) chunk = size - idx;
@@ -556,7 +578,7 @@ void emit_main_stub(char *entry_label)
   out_str("    mov rbp, rsp\n");
   out_str("    sub rsp, 8\n");
   out_str("    lea r12, [rel vm_stack + ");
-  out_int(STACK_SLOTS * (int)sizeof(int));
+  out_int(STACK_SLOTS * WORD_SIZE);
   out_str("]\n");
   out_str("    mov r13, r12\n");
   out_str("    sub r12, 8\n");
@@ -587,17 +609,16 @@ void emit_note_stack()
   out_str("    db 0\n\n");
 }
 
-void emit_load_immediate(int value)
+void emit_load_immediate(long value)
 {
-  int offset, target;
-  if (data_start && value >= (int)data_start && value < (int)data) {
-    offset = value - (int)data_start;
+  if (data_start && value >= (long)data_start && value < (long)data) {
+    long offset = value - (long)data_start;
     out_str("    lea rax, [rel data_area + ");
     out_int(offset);
     out_str("]\n");
     return;
   }
-  target = pointer_to_index(value);
+  int target = pointer_to_index(value);
   if (target >= 0) {
     out_str("    lea rax, [rel ");
     out_str(labels[target]);
@@ -611,13 +632,11 @@ void emit_load_immediate(int value)
 
 void emit_printf_call(int idx)
 {
-  int args, j;
-  args = call_arg_count(idx);
+  int args = call_arg_count(idx), j = 0;
   if (args <= 0 || args > 6) fail("printf supports up to 6 arguments");
   out_str("    lea r10, [r12 + ");
   out_int(args * 8);
   out_str("]\n");
-  j = 0;
   while (j < args && j < 6) {
     out_str("    mov ");
     out_str(printf_reg(j));
@@ -640,7 +659,7 @@ void emit_instruction(int idx)
   else if (op == LEA) {
     out_str("    lea rax, [r13");
     if (ins_arg[idx] >= 0) out_char('+');
-    out_int(ins_arg[idx] * (int)sizeof(int));
+    out_int(ins_arg[idx] * WORD_SIZE);
     out_str("]\n");
   }
   else if (op == LI) out_str("    mov rax, [rax]\n");
@@ -696,16 +715,14 @@ void emit_instruction(int idx)
     out_str("    mov r13, r12\n");
     if (ins_arg[idx]) {
       out_str("    sub r12, ");
-      out_int(ins_arg[idx] * (int)sizeof(int));
+      out_int(ins_arg[idx] * WORD_SIZE);
       out_char('\n');
     }
   }
-  else if (op == ADJ) {
-    if (ins_arg[idx]) {
-      out_str("    add r12, ");
-      out_int(ins_arg[idx] * (int)sizeof(int));
-      out_char('\n');
-    }
+  else if (op == ADJ && ins_arg[idx]) {
+    out_str("    add r12, ");
+    out_int(ins_arg[idx] * WORD_SIZE);
+    out_char('\n');
   }
   else if (op == LEV) {
     out_str("    mov r12, r13\n");
@@ -800,23 +817,18 @@ void emit_instruction(int idx)
 
 int open_output(char *path)
 {
-  int fd;
-  fd = open(path, 577, 420);
-  if (fd < 0) {
-    printf("could not open %s\n", path);
-    exit(-1);
-  }
+  int fd = open(path, 577, 420);
+  if (fd < 0) { printf("could not open %s\n", path); exit(-1); }
   return fd;
 }
 
-void generate_nasm(char *path, int entry_addr)
+void generate_nasm(char *path, long entry_addr)
 {
-  int i, entry_index;
+  int i = 0, entry_index;
   hex_digits = "0123456789abcdef";
   build_instructions();
   labels = malloc(sizeof(char *) * ins_count);
   if (!labels) fail("out of memory");
-  i = 0;
   while (i < ins_count) { labels[i] = make_numeric_label(i); ++i; }
   assign_function_labels();
   entry_index = pointer_to_index(entry_addr);
@@ -861,10 +873,10 @@ void generate_nasm(char *path, int entry_addr)
 
 int main(int argc, char **argv)
 {
-  int fd, bt, ty, poolsz, *idmain, i;
-  char *out_path;
+  int fd, bt, ty, poolsz, i;
+  long *idmain;
+  char *out_path = "out.s";
 
-  out_path = "out.s";
   --argc; ++argv;
   while (argc > 0 && (*argv)[0] == '-') {
     if ((*argv)[1] == 'S' && (*argv)[2] == 0) {
@@ -888,9 +900,10 @@ int main(int argc, char **argv)
   memset(data, 0, poolsz);
   e = text;
   data_start = data;
-  p = "char else enum if int return sizeof while open read close write printf malloc free memset memcmp exit void main";
+  p = "char else enum if int return sizeof while open read close write printf malloc free memset memcmp exit long void main";
   i = Char; while (i <= While) { next(); id[Tk] = i++; } // add keywords to symbol table
   i = OPEN; while (i <= EXIT) { next(); id[Class] = Sys; id[Type] = INT; id[Val] = i++; } // add library to symbol table
+  next(); id[Tk] = Int;  // handle long type
   next(); id[Tk] = Char; // handle void type
   next(); idmain = id; // keep track of main
 
@@ -935,9 +948,10 @@ int main(int argc, char **argv)
       next();
       id[Type] = ty;
       if (tk == '(') { // function
+        long *ent_slot;
         id[Class] = Fun;
-        id[Val] = (int)(e + 1);
-        next(); i = 0;
+        id[Val] = (long)(e + 1);
+        next(); local_slot_count = 0;
         while (tk != ')') {
           ty = INT;
           if (tk == Int) next();
@@ -947,32 +961,19 @@ int main(int argc, char **argv)
           if (id[Class] == Loc) { printf("%d: duplicate parameter definition\n", line); return -1; }
           id[HClass] = id[Class]; id[Class] = Loc;
           id[HType]  = id[Type];  id[Type] = ty;
-          id[HVal]   = id[Val];   id[Val] = i++;
+          id[HVal]   = id[Val];   id[Val] = local_slot_count++;
           next();
           if (tk == ',') next();
         }
         next();
         if (tk != '{') { printf("%d: bad function definition\n", line); return -1; }
-        loc = ++i;
+        loc = ++local_slot_count;
         next();
-        while (tk == Int || tk == Char) {
-          bt = (tk == Int) ? INT : CHAR;
-          next();
-          while (tk != ';') {
-            ty = bt;
-            while (tk == Mul) { next(); ty = ty + PTR; }
-            if (tk != Id) { printf("%d: bad local declaration\n", line); return -1; }
-            if (id[Class] == Loc) { printf("%d: duplicate local definition\n", line); return -1; }
-            id[HClass] = id[Class]; id[Class] = Loc;
-            id[HType]  = id[Type];  id[Type] = ty;
-            id[HVal]   = id[Val];   id[Val] = ++i;
-            next();
-            if (tk == ',') next();
-          }
-          next();
-        }
-        *++e = ENT; *++e = i - loc;
+        *++e = ENT;
+        ent_slot = ++e;
+        *ent_slot = 0;
         while (tk != '}') stmt();
+        *ent_slot = local_slot_count - loc;
         *++e = LEV;
         id = sym; // unwind symbol table locals
         while (id[Tk]) {
@@ -986,8 +987,8 @@ int main(int argc, char **argv)
       }
       else {
         id[Class] = Glo;
-        id[Val] = (int)data;
-        data = data + sizeof(int);
+        id[Val] = (long)data;
+        data = data + WORD_SIZE;
       }
       if (tk == ',') next();
     }
