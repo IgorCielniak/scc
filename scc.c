@@ -23,7 +23,7 @@ long ival;       // current token value
 // tokens and classes (operators last and in precedence order)
 enum { Num = 128, Fun, Sys, Glo, Loc, Id, Char, Else, Enum, If, Int, Return, Sizeof, While, Assign, Cond, Lor, Lan, Or, Xor, And, Eq, Ne, Lt, Gt, Le, Ge, Shl, Shr, Add, Sub, Mul, Div, Mod, Inc, Dec, Brak };
 // opcodes
-enum { LEA, IMM, JMP, JSR, BZ, BNZ, ENT, ADJ, LEV, LI, LC, SI, SC, PSH, OR, XOR, AND, EQ, NE, LT, GT, LE, GE, SHL, SHR, ADD, SUB, MUL, DIV, MOD, OPEN, READ, CLOS, WRIT, PRTF, MALC, FREE, MSET, MCMP, EXIT };
+enum { LEA, IMM, JMP, JSR, BZ, BNZ, ENT, ADJ, LEV, LI, LC, SI, SC, PSH, OR, XOR, AND, EQ, NE, LT, GT, LE, GE, SHL, SHR, ADD, SUB, MUL, DIV, MOD, OPEN, READ, CLOS, WRIT, PRTF, MALC, FREE, MSET, MCMP, EXIT, FORKSYS, EXECVP, WAITPID, UNLINKSYS, GETPID };
 // types
 enum { CHAR, INT, PTR };
 // identifier offsets (since we can't create an ident struct)
@@ -538,6 +538,95 @@ void assign_function_labels()
   }
 }
 
+void emit_instruction_metadata(int idx)
+{
+  long arg = ins_arg[idx];
+  int op = ins_op[idx];
+  int kind = 0;
+  long value = arg;
+  int target = -1;
+  if (op == IMM) {
+    if (data_start && arg >= (long)data_start && arg < (long)data) {
+      kind = 1;
+      value = arg - (long)data_start;
+    }
+    else {
+      target = pointer_to_index(arg);
+      if (target >= 0) {
+        kind = 2;
+        value = target;
+      }
+      else kind = 0;
+    }
+  }
+  else if (op == JMP || op == JSR || op == BZ || op == BNZ) {
+    target = pointer_to_index(arg);
+    if (target < 0) fail("invalid metadata target");
+    kind = 3;
+    value = target;
+  }
+  else {
+    kind = 0;
+    value = arg;
+  }
+  out_str(";INS ");
+  out_int(idx);
+  out_char(' ');
+  out_int(op);
+  out_char(' ');
+  out_int(kind);
+  out_char(' ');
+  out_int(value);
+  out_char('\n');
+}
+
+void emit_metadata(int entry_index)
+{
+  int i = 0;
+  out_str(";SCC-META-BEGIN\n");
+  out_str(";STACK_SLOTS ");
+  out_int(STACK_SLOTS);
+  out_char('\n');
+  out_str(";BSS_SIZE ");
+  out_int(STACK_SLOTS * WORD_SIZE);
+  out_char('\n');
+  out_str(";ENTRY_INDEX ");
+  out_int(entry_index);
+  out_char('\n');
+  out_str(";LABEL_COUNT ");
+  out_int(ins_count);
+  out_char('\n');
+  while (i < ins_count) {
+    out_str(";LABEL ");
+    out_int(i);
+    out_char(' ');
+    out_str(labels[i]);
+    out_char('\n');
+    ++i;
+  }
+  out_str(";INS_COUNT ");
+  out_int(ins_count);
+  out_char('\n');
+  i = 0;
+  while (i < ins_count) {
+    emit_instruction_metadata(i);
+    ++i;
+  }
+  out_str(";DATA_SIZE ");
+  out_int((int)(data - data_start));
+  out_char('\n');
+  i = 0;
+  while (i < (int)(data - data_start)) {
+    out_str(";DATA ");
+    out_int(i);
+    out_char(' ');
+    out_int(data_start[i] & 255);
+    out_char('\n');
+    ++i;
+  }
+  out_str(";SCC-META-END\n\n");
+}
+
 void emit_data_section()
 {
   int size = (int)(data - data_start), idx = 0, chunk, j, byte;
@@ -811,6 +900,27 @@ void emit_instruction(int idx)
     out_str("    mov rdi, [r12]\n");
     out_str("    call exit\n");
   }
+  else if (op == FORKSYS) {
+    out_str("    call fork\n");
+  }
+  else if (op == EXECVP) {
+    out_str("    mov rdi, [r12 + 8]\n");
+    out_str("    mov rsi, [r12]\n");
+    out_str("    call execvp\n");
+  }
+  else if (op == WAITPID) {
+    out_str("    mov rdi, [r12 + 16]\n");
+    out_str("    mov rsi, [r12 + 8]\n");
+    out_str("    mov rdx, [r12]\n");
+    out_str("    call waitpid\n");
+  }
+  else if (op == UNLINKSYS) {
+    out_str("    mov rdi, [r12]\n");
+    out_str("    call unlink\n");
+  }
+  else if (op == GETPID) {
+    out_str("    call getpid\n");
+  }
   else fail("unknown opcode");
   out_char('\n');
 }
@@ -848,8 +958,14 @@ void generate_nasm(char *path, long entry_addr)
   out_str("extern read\n");
   out_str("extern write\n");
   out_str("extern close\n");
-  out_str("extern exit\n\n");
+  out_str("extern exit\n");
+  out_str("extern fork\n");
+  out_str("extern execvp\n");
+  out_str("extern waitpid\n");
+  out_str("extern unlink\n");
+  out_str("extern getpid\n\n");
   out_str("global main\n\n");
+  emit_metadata(entry_index);
   emit_data_section();
   emit_bss_section();
   emit_main_stub(labels[entry_index]);
@@ -900,9 +1016,9 @@ int main(int argc, char **argv)
   memset(data, 0, poolsz);
   e = text;
   data_start = data;
-  p = "char else enum if int return sizeof while open read close write printf malloc free memset memcmp exit long void main";
+  p = "char else enum if int return sizeof while open read close write printf malloc free memset memcmp exit fork execvp waitpid unlink getpid long void main";
   i = Char; while (i <= While) { next(); id[Tk] = i++; } // add keywords to symbol table
-  i = OPEN; while (i <= EXIT) { next(); id[Class] = Sys; id[Type] = INT; id[Val] = i++; } // add library to symbol table
+  i = OPEN; while (i <= GETPID) { next(); id[Class] = Sys; id[Type] = INT; id[Val] = i++; } // add library to symbol table
   next(); id[Tk] = Int;  // handle long type
   next(); id[Tk] = Char; // handle void type
   next(); idmain = id; // keep track of main
